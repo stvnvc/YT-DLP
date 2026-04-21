@@ -37,6 +37,15 @@ class DownloadTab(ctk.CTkFrame):
         ctk.CTkEntry(opts, textvariable=self.folder_var, width=300).pack(side="left", padx=5)
         ctk.CTkButton(opts, text="Browse", width=70, command=self._browse_folder).pack(side="left")
 
+        # -- Extra options row ------------------------------------------------
+        extra = ctk.CTkFrame(self, fg_color="transparent")
+        extra.pack(fill="x", padx=10, pady=(0, 5))
+        self.premiere_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            extra, text="Premiere-ready (transcode to H.265 after download)",
+            variable=self.premiere_var,
+        ).pack(side="left")
+
         # -- Buttons ----------------------------------------------------------
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
         btn_row.pack(fill="x", padx=10, pady=5)
@@ -82,7 +91,8 @@ class DownloadTab(ctk.CTkFrame):
                 job_name = f"{name}_{i + 1}"
             else:
                 job_name = name
-            job = DownloadJob(url=url, quality=quality, output_folder=folder, output_name=job_name)
+            job = DownloadJob(url=url, quality=quality, output_folder=folder, output_name=job_name,
+                              premiere_ready=self.premiere_var.get())
             self._job_ids.add(job.job_id)
             self.job_queue.put(job)
 

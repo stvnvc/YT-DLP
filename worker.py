@@ -1,6 +1,7 @@
 import itertools
 import os
 import queue
+import re
 import subprocess
 import threading
 from dataclasses import dataclass, field
@@ -21,6 +22,10 @@ QUALITY_MAP = {
     "Audio only (MP3)": ("bestaudio", True),
 }
 
+_DEST_RE = re.compile(r"\[download\] Destination: (.+)")
+_MERGE_RE = re.compile(r'\[Merger\] Merging formats into "(.+)"')
+_DURATION_RE = re.compile(r"Duration: (\d{2}):(\d{2}):(\d{2})\.(\d+)")
+
 _job_counter = itertools.count(1)
 
 
@@ -34,6 +39,7 @@ class DownloadJob:
     quality: str
     output_folder: str
     output_name: str = ""  # empty = use video title
+    premiere_ready: bool = False
     job_id: int = field(default_factory=next_job_id)
     tab: str = "download"
 
@@ -118,6 +124,7 @@ class Worker(threading.Thread):
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
 
+        output_file = None
         for line in self._current_process.stdout:
             if self._cancel_flag.is_set():
                 self._current_process.kill()
@@ -126,6 +133,13 @@ class Worker(threading.Thread):
             line = line.strip()
             if not line:
                 continue
+            m = _MERGE_RE.search(line)
+            if m:
+                output_file = m.group(1).strip('"')
+            else:
+                m = _DEST_RE.search(line)
+                if m:
+                    output_file = m.group(1).strip()
             pct = parse_ytdlp_progress(line)
             if pct is not None:
                 self._emit(job.tab, job.job_id, "progress", percent=pct)
@@ -134,10 +148,78 @@ class Worker(threading.Thread):
 
         rc = self._current_process.wait()
         self._current_process = None
+        if rc != 0:
+            self._emit(job.tab, job.job_id, "error", message=f"yt-dlp failed (exit {rc})")
+            return
+
+        if job.premiere_ready and output_file and not audio_only:
+            self._emit(job.tab, job.job_id, "log", line="Transcoding to H.265 for Premiere...")
+            self._run_transcode(job, output_file)
+        else:
+            self._emit(job.tab, job.job_id, "complete", message=f"Done: {job.url}")
+
+    def _run_transcode(self, job: DownloadJob, input_path: str):
+        stem, _ = os.path.splitext(input_path)
+        temp_path = stem + "_h265_tmp.mp4"
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", input_path,
+            "-c:v", "libx265", "-preset", "medium", "-crf", "23",
+            "-tag:v", "hvc1",
+            "-c:a", "aac", "-b:a", "192k",
+            temp_path,
+        ]
+
+        self._current_process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+
+        duration_sec = 0.0
+        buf = bytearray()
+        while True:
+            byte = self._current_process.stderr.read(1)
+            if not byte:
+                break
+            if byte in (b"\r", b"\n"):
+                if buf:
+                    line = buf.decode("utf-8", errors="replace").strip()
+                    buf.clear()
+                    if self._cancel_flag.is_set():
+                        self._current_process.kill()
+                        self._emit(job.tab, job.job_id, "error", message="Cancelled")
+                        try:
+                            os.remove(temp_path)
+                        except OSError:
+                            pass
+                        return
+                    if duration_sec == 0.0:
+                        m = _DURATION_RE.search(line)
+                        if m:
+                            h, mi, s, frac = m.groups()
+                            duration_sec = int(h) * 3600 + int(mi) * 60 + int(s) + int(frac) / (10 ** len(frac))
+                    pct = parse_ffmpeg_progress(line, duration_sec)
+                    if pct is not None:
+                        self._emit(job.tab, job.job_id, "progress", percent=pct)
+            else:
+                buf += byte
+
+        rc = self._current_process.wait()
+        self._current_process = None
+
         if rc == 0:
+            os.replace(temp_path, input_path)
             self._emit(job.tab, job.job_id, "complete", message=f"Done: {job.url}")
         else:
-            self._emit(job.tab, job.job_id, "error", message=f"yt-dlp failed (exit {rc})")
+            self._emit(job.tab, job.job_id, "error", message="ffmpeg transcode failed")
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
     # -- cut --------------------------------------------------------------
 
